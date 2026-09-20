@@ -1,0 +1,8 @@
+secret.key
+__pycache__/
+*.pyc
+uploads/*
+exports/*
+.env
+.venv/
+venv/

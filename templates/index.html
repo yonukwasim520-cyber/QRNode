@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>YQR</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #101010;
+    color: white;
+    font-family: sans-serif;
+}
+
+.container {
+    max-width: 700px;
+    margin: auto;
+    padding: 25px;
+}
+
+h1 {
+    text-align: center;
+    margin-bottom: 30px;
+}
+
+.card {
+    background: #1d1d1d;
+    border-radius: 18px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.card h2 {
+    margin-top: 0;
+}
+
+textarea {
+    width: 100%;
+    min-height: 180px;
+    resize: vertical;
+    background: #101010;
+    color: white;
+    border: 1px solid #444;
+    border-radius: 12px;
+    padding: 15px;
+    font-size: 16px;
+}
+
+button {
+    width: 100%;
+    border: 0;
+    border-radius: 12px;
+    padding: 14px;
+    margin-top: 15px;
+    font-size: 17px;
+    cursor: pointer;
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+input[type=file] {
+    width: 100%;
+    margin-top: 10px;
+}
+
+.qr-image {
+    width: 100%;
+    max-width: 600px;
+    display: block;
+    margin: 20px auto;
+    background: white;
+    border-radius: 10px;
+}
+
+.download {
+    display: block;
+    text-align: center;
+    background: white;
+    color: black;
+    text-decoration: none;
+    border-radius: 12px;
+    padding: 14px;
+    margin-top: 15px;
+}
+
+.error {
+    background: #401b1b;
+    padding: 15px;
+    border-radius: 12px;
+    margin-bottom: 20px;
+}
+
+.success {
+    background: #193b23;
+    padding: 15px;
+    border-radius: 12px;
+    margin-bottom: 20px;
+}
+
+.result {
+    background: #101010;
+    padding: 15px;
+    border-radius: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    direction: auto;
+}
+
+.status {
+    margin-top: 15px;
+    padding: 12px;
+    border-radius: 12px;
+    background: #292929;
+    text-align: center;
+}
+
+.hidden {
+    display: none;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>YQR</h1>
+
+
+<!-- =====================================================
+     Create QR
+     ===================================================== -->
+
+<div class="card">
+
+<h2>Add QR</h2>
+
+<form id="createForm">
+
+<textarea
+    id="textInput"
+    name="text"
+    placeholder="Enter Anything here..."
+    required
+></textarea>
+
+<button
+    id="createButton"
+    type="submit"
+>
+    Create QR
+</button>
+
+</form>
+
+<div
+    id="createStatus"
+    class="status hidden"
+></div>
+
+</div>
+
+
+<!-- =====================================================
+     نتيجة Create QR
+     ===================================================== -->
+
+<div
+    id="generatedCard"
+    class="card hidden"
+>
+
+<h2>Created Image</h2>
+
+<img
+    id="qrImage"
+    class="qr-image"
+    alt="YQR"
+>
+
+<a
+    id="downloadLink"
+    class="download"
+    href="#"
+    download
+>
+    Download Image
+</a>
+
+</div>
+
+
+<!-- =====================================================
+     Read QR
+     ===================================================== -->
+
+<div class="card">
+
+<h2>Read</h2>
+
+<form
+    id="readForm"
+    enctype="multipart/form-data"
+>
+
+<p>
+Select a YQR image exported from this site.
+</p>
+
+<input
+    type="file"
+    id="imageInput"
+    name="file"
+    accept="image/png,image/jpeg"
+    required
+>
+
+<button
+    id="readButton"
+    type="submit"
+>
+    Read QR
+</button>
+
+</form>
+
+<div
+    id="readStatus"
+    class="status hidden"
+></div>
+
+</div>
+
+
+<!-- =====================================================
+     نتيجة الRead
+     ===================================================== -->
+
+<div
+    id="resultCard"
+    class="card hidden"
+>
+
+<div
+    id="resultSuccess"
+    class="success hidden"
+>
+    QR decrypted successfully
+</div>
+
+<div
+    id="resultError"
+    class="error hidden"
+></div>
+
+<p id="partsInfo"></p>
+
+<div
+    id="decodedText"
+    class="result"
+></div>
+
+</div>
+
+
+</div>
+
+
+<script>
+
+/* ========================================================
+   Helpers
+   ======================================================== */
+
+function show(element) {
+    element.classList.remove("hidden");
+}
+
+function hide(element) {
+    element.classList.add("hidden");
+}
+
+function setStatus(element, text) {
+    element.textContent = text;
+    show(element);
+}
+
+
+/* ========================================================
+   CREATE
+   ======================================================== */
+
+const createForm =
+    document.getElementById("createForm");
+
+const createButton =
+    document.getElementById("createButton");
+
+const textInput =
+    document.getElementById("textInput");
+
+const createStatus =
+    document.getElementById("createStatus");
+
+const generatedCard =
+    document.getElementById("generatedCard");
+
+const qrImage =
+    document.getElementById("qrImage");
+
+const downloadLink =
+    document.getElementById("downloadLink");
+
+
+createForm.addEventListener(
+    "submit",
+    async function(event) {
+
+        event.preventDefault();
+
+        const text = textInput.value;
+
+        if (!text.trim()) {
+            setStatus(
+                createStatus,
+                "Enter نصًا أولًا."
+            );
+            return;
+        }
+
+        createButton.disabled = true;
+
+        setStatus(
+            createStatus,
+            "جاري Create QR..."
+        );
+
+        hide(generatedCard);
+
+        try {
+
+            const response = await fetch(
+                "/create",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        text: text
+                    })
+                }
+            );
+
+            const data =
+                await response.json();
+
+            if (!response.ok || !data.ok) {
+                throw new Error(
+                    data.error ||
+                    "فشل Create QR"
+                );
+            }
+
+            /* صورة QR */
+
+            qrImage.src =
+                data.url +
+                "?t=" +
+                Date.now();
+
+            /* رابط الDownload */
+
+            downloadLink.href =
+                data.download;
+
+            downloadLink.download =
+                data.filename;
+
+            show(generatedCard);
+
+            setStatus(
+                createStatus,
+                "Image created successfully."
+            );
+
+        } catch (error) {
+
+            setStatus(
+                createStatus,
+                error.message ||
+                "حدث Error أثناء Create QR."
+            );
+
+        } finally {
+
+            createButton.disabled = false;
+        }
+    }
+);
+
+
+/* ========================================================
+   READ
+   ======================================================== */
+
+const readForm =
+    document.getElementById("readForm");
+
+const imageInput =
+    document.getElementById("imageInput");
+
+const readButton =
+    document.getElementById("readButton");
+
+const readStatus =
+    document.getElementById("readStatus");
+
+const resultCard =
+    document.getElementById("resultCard");
+
+const resultSuccess =
+    document.getElementById("resultSuccess");
+
+const resultError =
+    document.getElementById("resultError");
+
+const partsInfo =
+    document.getElementById("partsInfo");
+
+const decodedText =
+    document.getElementById("decodedText");
+
+
+readForm.addEventListener(
+    "submit",
+    async function(event) {
+
+        event.preventDefault();
+
+        const file =
+            imageInput.files[0];
+
+        if (!file) {
+            setStatus(
+                readStatus,
+                "Choose صورة أولًا."
+            );
+            return;
+        }
+
+        readButton.disabled = true;
+
+        setStatus(
+            readStatus,
+            "جاري Read QR..."
+        );
+
+        hide(resultCard);
+        hide(resultSuccess);
+        hide(resultError);
+
+        try {
+
+            const formData =
+                new FormData();
+
+            formData.append(
+                "file",
+                file
+            );
+
+            const response = await fetch(
+                "/read",
+                {
+                    method: "POST",
+                    body: formData
+                }
+            );
+
+            const data =
+                await response.json();
+
+            show(resultCard);
+
+            if (!response.ok || !data.ok) {
+
+                resultError.textContent =
+                    data.error ||
+                    "فشل Read QR";
+
+                show(resultError);
+
+                partsInfo.textContent = "";
+
+                decodedText.textContent = "";
+
+                setStatus(
+                    readStatus,
+                    "فشلت الRead."
+                );
+
+                return;
+            }
+
+            /* Success */
+
+            show(resultSuccess);
+
+            partsInfo.textContent =
+                "QR parts: " +
+                data.parts +
+                " — Read: " +
+                data.decoded;
+
+            decodedText.textContent =
+                data.text;
+
+            setStatus(
+                readStatus,
+                "QR read and decrypted successfully."
+            );
+
+        } catch (error) {
+
+            show(resultCard);
+
+            resultError.textContent =
+                error.message ||
+                "حدث Error أثناء الRead.";
+
+            show(resultError);
+
+            setStatus(
+                readStatus,
+                "حدث Error أثناء الاتصال بالخادم."
+            );
+
+        } finally {
+
+            readButton.disabled = false;
+        }
+    }
+);
+
+</script>
+
+</body>
+
+</html>

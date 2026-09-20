@@ -1,0 +1,1027 @@
+from flask import Flask, request, jsonify, send_from_directory, render_template, send_file
+from io import BytesIO
+import time
+from PIL import Image
+from Crypto.Cipher import AES
+import base64
+import hashlib
+import hmac
+import json
+import os
+import tempfile
+import uuid
+import ctypes
+import io
+import time
+
+app = Flask(__name__)
+
+# مجلد مؤقت لصور YQR
+YQR_TEMP_DIR = tempfile.mkdtemp(prefix="yqr_")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXPORT_DIR = os.path.join(BASE_DIR, "exports")
+
+# صور YQR المؤقتة في RAM فقط
+TEMP_PNG_MEMORY = {}
+TEMP_PNG_TTL = 600  # 10 دقائق
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+KEY_FILE = os.path.join(BASE_DIR, "secret.key")
+ZXING_FILE = os.path.join(BASE_DIR, "yqr_zxing.so")
+
+os.makedirs(EXPORT_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+PORT = 5990
+
+# حجم البيانات المشفرة التي نضعها في كل QR
+CHUNK_SIZE = 300
+
+# إعدادات شكل QR
+QR_SCALE = 8
+QR_BORDER = 4
+
+# عدد QR في كل صف داخل الصورة النهائية
+COLUMNS = 4
+
+# المسافة بين QR
+GAP = 40
+
+
+# ============================================================
+# Secret key
+# ============================================================
+
+def load_secret_key():
+    if not os.path.exists(KEY_FILE):
+        key = os.urandom(32)
+
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+
+        try:
+            os.chmod(KEY_FILE, 0o600)
+        except Exception:
+            pass
+
+        return key
+
+    with open(KEY_FILE, "rb") as f:
+        key = f.read()
+
+    if len(key) != 32:
+        raise RuntimeError(
+            "secret.key يجب أن يحتوي على 32 bytes بالضبط"
+        )
+
+    return key
+
+
+SECRET_KEY = load_secret_key()
+
+
+# ============================================================
+# ZXing-C++ native library
+# ============================================================
+
+if not os.path.exists(ZXING_FILE):
+    raise RuntimeError(
+        f"Not found: {ZXING_FILE}\n"
+        "تأكد من بناء yqr_zxing.so داخل ~/QRNode"
+    )
+
+
+zxing = ctypes.CDLL(ZXING_FILE)
+
+zxing.yqr_decode_gray.argtypes = [
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.c_int,
+    ctypes.c_int
+]
+
+zxing.yqr_decode_gray.restype = ctypes.c_void_p
+
+zxing.yqr_free.argtypes = [
+    ctypes.c_void_p
+]
+
+zxing.yqr_free.restype = None
+
+
+# ============================================================
+# Base64 helpers
+# ============================================================
+
+def b64e(data):
+    return base64.urlsafe_b64encode(data).decode("ascii")
+
+
+def b64d(data):
+    return base64.urlsafe_b64decode(data.encode("ascii"))
+
+
+# ============================================================
+# AES-GCM
+# ============================================================
+
+def encrypt_text(text):
+    data = text.encode("utf-8")
+
+    nonce = os.urandom(12)
+
+    cipher = AES.new(
+        SECRET_KEY,
+        AES.MODE_GCM,
+        nonce=nonce
+    )
+
+    ciphertext, tag = cipher.encrypt_and_digest(data)
+
+    # nonce + tag + ciphertext
+    packed = nonce + tag + ciphertext
+
+    return b64e(packed)
+
+
+def decrypt_text(encoded):
+    packed = b64d(encoded)
+
+    if len(packed) < 12 + 16:
+        raise ValueError("بيانات AES غير صالحة")
+
+    nonce = packed[:12]
+    tag = packed[12:28]
+    ciphertext = packed[28:]
+
+    cipher = AES.new(
+        SECRET_KEY,
+        AES.MODE_GCM,
+        nonce=nonce
+    )
+
+    plaintext = cipher.decrypt_and_verify(
+        ciphertext,
+        tag
+    )
+
+    return plaintext.decode("utf-8")
+
+
+# ============================================================
+# HMAC
+# ============================================================
+
+def make_signature(group_id, total, encrypted):
+    message = f"{group_id}|{total}|{encrypted}".encode("utf-8")
+
+    return hmac.new(
+        SECRET_KEY,
+        message,
+        hashlib.sha256
+    ).hexdigest()[:24]
+
+
+def verify_signature(group_id, total, encrypted, signature):
+    expected = make_signature(
+        group_id,
+        total,
+        encrypted
+    )
+
+    return hmac.compare_digest(
+        expected,
+        signature
+    )
+
+
+# ============================================================
+# Split
+# ============================================================
+
+def split_data(data, size=CHUNK_SIZE):
+    return [
+        data[i:i + size]
+        for i in range(0, len(data), size)
+    ]
+
+
+# ============================================================
+# YQR parser
+# ============================================================
+
+def parse_yqr(payload):
+    if not payload.startswith("YQR1|"):
+        raise ValueError("ليس YQR")
+
+    fields = {}
+
+    for part in payload.split("|")[1:]:
+        if "=" not in part:
+            continue
+
+        key, value = part.split("=", 1)
+        fields[key] = value
+
+    required = [
+        "G",
+        "P",
+        "T",
+        "D",
+        "S"
+    ]
+
+    for key in required:
+        if key not in fields:
+            raise ValueError(
+                f"YQR ناقص: {key}"
+            )
+
+    group_id = fields["G"]
+    position = int(fields["P"])
+    total = int(fields["T"])
+    encrypted = fields["D"]
+    signature = fields["S"]
+
+    if position < 1:
+        raise ValueError("رقم Invalid part")
+
+    if total < 1:
+        raise ValueError("عدد الأجزاء غير صالح")
+
+    if position > total:
+        raise ValueError("رقم الجزء أكبر من العدد الكلي")
+
+    # لا نتحقق من HMAC هنا.
+    # التوقيع تم إنشاؤه على encrypted الكامل،
+    # بينما D هنا مجرد جزء واحد منه.
+    # سيتم التحقق بعد تجميع جميع الأجزاء.
+
+    return {
+        "group": group_id,
+        "position": position,
+        "total": total,
+        "data": encrypted,
+        "signature": signature
+    }
+
+
+# ============================================================
+# ZXing decode
+# ============================================================
+
+def zxing_decode_image(image):
+    """
+    يأخذ PIL Image ويرسل grayscale pixels
+    إلى ZXing-C++.
+    """
+
+    gray = image.convert("L")
+
+    width, height = gray.size
+
+    if width <= 0 or height <= 0:
+        return None
+
+    raw = gray.tobytes()
+
+    buffer = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+
+    ptr = zxing.yqr_decode_gray(
+        buffer,
+        width,
+        height
+    )
+
+    if not ptr:
+        return None
+
+    try:
+        result = ctypes.string_at(ptr).decode(
+            "utf-8",
+            errors="replace"
+        )
+    finally:
+        zxing.yqr_free(ptr)
+
+    if not result.startswith("YQR1|"):
+        return None
+
+    return result
+
+
+# ============================================================
+# Read PNG metadata
+# ============================================================
+
+def get_yqr_metadata(image):
+    meta = image.info.get("YQR_META")
+
+    if not meta:
+        raise ValueError(
+            "الصورة لا تحتوي على YQR_META"
+        )
+
+    if isinstance(meta, bytes):
+        meta = meta.decode("utf-8")
+
+    metadata = json.loads(meta)
+
+    if metadata.get("version") != 1:
+        raise ValueError(
+            "إصدار YQR_META غير مدعوم"
+        )
+
+    if "boxes" not in metadata:
+        raise ValueError(
+            "YQR_META لا يحتوي على boxes"
+        )
+
+    return metadata
+
+
+# ============================================================
+# Create QR image
+# ============================================================
+
+def create_qr_image(payloads, group_id):
+    """
+    إنشاء QR واحد أو عدة QR داخل PNG واحد.
+
+    كل QR له box معروف ومسجل داخل YQR_META.
+    """
+
+    import segno
+
+    qr_images = []
+
+    for payload in payloads:
+        qr = segno.make(
+            payload,
+            error="h"
+        )
+
+        buffer = io.BytesIO()
+
+        qr.save(
+            buffer,
+            kind="png",
+            scale=QR_SCALE,
+            border=QR_BORDER
+        )
+
+        buffer.seek(0)
+
+        img = Image.open(buffer).convert("RGB")
+
+        qr_images.append(img)
+
+    if not qr_images:
+        raise ValueError(
+            "لا توجد QR"
+        )
+
+    qr_width = max(
+        img.width for img in qr_images
+    )
+
+    qr_height = max(
+        img.height for img in qr_images
+    )
+
+    total = len(qr_images)
+
+    columns = min(
+        COLUMNS,
+        total
+    )
+
+    rows = (total + columns - 1) // columns
+
+    canvas_width = (
+        columns * qr_width
+        + (columns + 1) * GAP
+    )
+
+    canvas_height = (
+        rows * qr_height
+        + (rows + 1) * GAP
+    )
+
+    canvas = Image.new(
+        "RGB",
+        (canvas_width, canvas_height),
+        "white"
+    )
+
+    boxes = []
+
+    for index, qr_img in enumerate(qr_images):
+
+        row = index // columns
+        col = index % columns
+
+        x = GAP + col * (
+            qr_width + GAP
+        )
+
+        y = GAP + row * (
+            qr_height + GAP
+        )
+
+        canvas.paste(
+            qr_img,
+            (x, y)
+        )
+
+        boxes.append([
+            x,
+            y,
+            qr_img.width,
+            qr_img.height
+        ])
+
+    metadata = {
+        "version": 1,
+        "group": group_id,
+        "total": total,
+        "columns": columns,
+        "rows": rows,
+        "gap": GAP,
+        "boxes": boxes
+    }
+
+    canvas.info["YQR_META"] = json.dumps(
+        metadata,
+        separators=(",", ":")
+    )
+
+    return canvas, metadata
+
+
+# ============================================================
+# Save PNG with metadata
+# ============================================================
+
+def save_png_with_metadata(image, metadata, path):
+
+    pnginfo = None
+
+    try:
+        from PIL.PngImagePlugin import PngInfo
+
+        pnginfo = PngInfo()
+
+        pnginfo.add_text(
+            "YQR_META",
+            json.dumps(
+                metadata,
+                separators=(",", ":")
+            )
+        )
+
+    except Exception:
+        pnginfo = None
+
+    if pnginfo:
+        image.save(
+            path,
+            format="PNG",
+            pnginfo=pnginfo
+        )
+    else:
+        image.save(
+            path,
+            format="PNG"
+        )
+
+
+# ============================================================
+# Routes
+# ============================================================
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ============================================================
+# CREATE
+# ============================================================
+
+@app.route("/create", methods=["POST"])
+def create():
+
+    try:
+        data = request.get_json(
+            silent=True
+        )
+
+        if data is None:
+            text = request.form.get(
+                "text",
+                ""
+            )
+        else:
+            text = data.get(
+                "text",
+                ""
+            )
+
+        if text is None:
+            text = ""
+
+        if not isinstance(text, str):
+            text = str(text)
+
+        if not text:
+            return jsonify({
+                "ok": False,
+                "error": "Text is empty"
+            }), 400
+
+        # ----------------------------------------------------
+        # Encrypt
+        # ----------------------------------------------------
+
+        encrypted = encrypt_text(text)
+
+        # ----------------------------------------------------
+        # Group ID
+        # ----------------------------------------------------
+
+        group_id = uuid.uuid4().hex[:12]
+
+        # ----------------------------------------------------
+        # Split
+        # ----------------------------------------------------
+
+        chunks = split_data(
+            encrypted,
+            CHUNK_SIZE
+        )
+
+        total = len(chunks)
+
+        # ----------------------------------------------------
+        # Create YQR payloads
+        # ----------------------------------------------------
+
+        payloads = []
+
+        for index, chunk in enumerate(
+            chunks,
+            start=1
+        ):
+
+            signature = make_signature(
+                group_id,
+                total,
+                encrypted
+            )
+
+            payload = (
+                f"YQR1|"
+                f"G={group_id}|"
+                f"P={index}|"
+                f"T={total}|"
+                f"D={chunk}|"
+                f"S={signature}"
+            )
+
+            payloads.append(payload)
+
+        # ----------------------------------------------------
+        # Create one PNG
+        # ----------------------------------------------------
+
+        image, metadata = create_qr_image(
+            payloads,
+            group_id
+        )
+
+        filename = (
+            f"{group_id}.png"
+        )
+
+        # إنشاء PNG في الذاكرة فقط — لا يتم حفظه في exports
+        png_buffer = BytesIO()
+
+        save_png_with_metadata(
+            image,
+            metadata,
+            png_buffer
+        )
+
+        png_buffer.seek(0)
+
+        # تنظيف الملفات المؤقتة القديمة
+        now = time.time()
+        for old_filename, item in list(TEMP_PNG_MEMORY.items()):
+            if now - item["time"] > TEMP_PNG_TTL:
+                del TEMP_PNG_MEMORY[old_filename]
+
+        TEMP_PNG_MEMORY[filename] = {
+            "data": png_buffer.getvalue(),
+            "time": now
+        }
+
+        return jsonify({
+            "ok": True,
+            "group": group_id,
+            "total": total,
+            "filename": filename,
+            "url": f"/exports/{filename}",
+            "download": f"/download/{filename}",
+            "width": image.width,
+            "height": image.height
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
+
+
+# ============================================================
+# READ
+# ============================================================
+
+@app.route("/read", methods=["POST"])
+def read():
+
+    upload_path = None
+
+    try:
+
+        if "file" not in request.files:
+            return jsonify({
+                "ok": False,
+                "error": "لم يتم إرسال صورة"
+            }), 400
+
+        file = request.files["file"]
+
+        if not file.filename:
+            return jsonify({
+                "ok": False,
+                "error": "اسم الملف فارغ"
+            }), 400
+
+        # ----------------------------------------------------
+        # Save temporary upload
+        # ----------------------------------------------------
+
+        temp_name = (
+            uuid.uuid4().hex
+            + ".png"
+        )
+
+        upload_path = os.path.join(
+            UPLOAD_DIR,
+            temp_name
+        )
+
+        file.save(upload_path)
+
+        # ----------------------------------------------------
+        # Open image
+        # ----------------------------------------------------
+
+        image = Image.open(
+            upload_path
+        )
+
+        # Force loading before temporary file cleanup
+        image.load()
+
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
+
+        metadata = get_yqr_metadata(
+            image
+        )
+
+        boxes = metadata["boxes"]
+
+        expected_total = int(
+            metadata["total"]
+        )
+
+        group_from_metadata = metadata.get(
+            "group"
+        )
+
+        # ----------------------------------------------------
+        # Decode each QR
+        # ----------------------------------------------------
+
+        parts = {}
+
+        failed_positions = []
+
+        start_time = time.perf_counter()
+
+        for index, box in enumerate(
+            boxes,
+            start=1
+        ):
+
+            try:
+
+                if len(box) != 4:
+                    failed_positions.append(index)
+                    continue
+
+                x, y, w, h = [
+                    int(v) for v in box
+                ]
+
+                if w <= 0 or h <= 0:
+                    failed_positions.append(index)
+                    continue
+
+                # Safety bounds
+                x2 = min(
+                    image.width,
+                    x + w
+                )
+
+                y2 = min(
+                    image.height,
+                    y + h
+                )
+
+                x = max(0, x)
+                y = max(0, y)
+
+                if x2 <= x or y2 <= y:
+                    failed_positions.append(index)
+                    continue
+
+                crop = image.crop(
+                    (x, y, x2, y2)
+                )
+
+                payload = zxing_decode_image(
+                    crop
+                )
+
+                if not payload:
+                    failed_positions.append(index)
+                    continue
+
+                try:
+                    part = parse_yqr(
+                        payload
+                    )
+                except Exception:
+                    failed_positions.append(index)
+                    continue
+
+                # Check metadata group
+                if (
+                    group_from_metadata
+                    and part["group"] != group_from_metadata
+                ):
+                    failed_positions.append(index)
+                    continue
+
+                if part["total"] != expected_total:
+                    failed_positions.append(index)
+                    continue
+
+                position = part["position"]
+
+                # Duplicate protection
+                if position not in parts:
+                    parts[position] = part
+
+            except Exception:
+                failed_positions.append(index)
+
+        elapsed = (
+            time.perf_counter()
+            - start_time
+        )
+
+        # ----------------------------------------------------
+        # Check all parts
+        # ----------------------------------------------------
+
+        missing = [
+            i for i in range(
+                1,
+                expected_total + 1
+            )
+            if i not in parts
+        ]
+
+        if missing:
+
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"تم العثور على "
+                    f"{len(parts)} من "
+                    f"{expected_total} أجزاء فقط"
+                ),
+                "found": len(parts),
+                "total": expected_total,
+                "missing": missing,
+                "failed_boxes": failed_positions,
+                "time": round(
+                    elapsed,
+                    3
+                )
+            }), 400
+
+        # ----------------------------------------------------
+        # Verify all encrypted data is identical
+        # ----------------------------------------------------
+
+        encrypted_parts = [
+            parts[i]["data"]
+            for i in range(
+                1,
+                expected_total + 1
+            )
+        ]
+
+        # IMPORTANT:
+        # The original encrypted payload is the same logical
+        # data that was split into chunks.
+        encrypted = "".join(
+            encrypted_parts
+        )
+
+        # ----------------------------------------------------
+        # Verify HMAC again on reconstructed data
+        # ----------------------------------------------------
+
+        first = parts[1]
+
+        if not verify_signature(
+            first["group"],
+            expected_total,
+            encrypted,
+            first["signature"]
+        ):
+
+            return jsonify({
+                "ok": False,
+                "error": "HMAC verification failed"
+            }), 400
+
+        # ----------------------------------------------------
+        # Verify signatures of every part
+        # ----------------------------------------------------
+
+        for position, part in parts.items():
+
+            if not verify_signature(
+                part["group"],
+                part["total"],
+                encrypted,
+                part["signature"]
+            ):
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"فشل توقيع الجزء "
+                        f"{position}"
+                    )
+                }), 400
+
+        # ----------------------------------------------------
+        # AES decrypt
+        # ----------------------------------------------------
+
+        plaintext = decrypt_text(
+            encrypted
+        )
+
+        # ----------------------------------------------------
+        # Success
+        # ----------------------------------------------------
+
+        return jsonify({
+            "ok": True,
+            "text": plaintext,
+            "group": first["group"],
+            "parts": expected_total,
+            "decoded": len(parts),
+            "time": round(
+                elapsed,
+                3
+            )
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
+
+    finally:
+
+        if upload_path:
+            try:
+                if os.path.exists(upload_path):
+                    os.remove(upload_path)
+            except Exception:
+                pass
+
+
+# ============================================================
+# Exported files
+# ============================================================
+
+@app.route("/exports/<path:filename>")
+def exported_file(filename):
+    item = TEMP_PNG_MEMORY.get(filename)
+
+    if item is None:
+        return jsonify({
+            "ok": False,
+            "error": "The temporary image has expired or is no longer available"
+        }), 404
+
+    # تحديث وقت الاستخدام
+    item["time"] = time.time()
+
+    return send_file(
+        BytesIO(item["data"]),
+        mimetype="image/png",
+        as_attachment=False,
+        download_name=filename
+    )
+
+
+@app.route("/download/<path:filename>")
+def download_file(filename):
+    item = TEMP_PNG_MEMORY.get(filename)
+
+    if item is None:
+        return jsonify({
+            "ok": False,
+            "error": "The temporary image has expired or is no longer available"
+        }), 404
+
+    # تجديد وقت الصورة عند استخدامها
+    item["time"] = time.time()
+
+    return send_file(
+        BytesIO(item["data"]),
+        mimetype="image/png",
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+# ============================================================
+# Health
+# ============================================================
+
+@app.route("/api/status")
+def status():
+
+    return jsonify({
+        "ok": True,
+        "service": "QRNode",
+        "reader": "ZXing-C++",
+        "reader_library": "yqr_zxing.so",
+        "port": PORT
+    })
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+
+    print()
+    print("======================================")
+    print(" QRNode")
+    print("======================================")
+    print("Reader : ZXing-C++")
+    print("Native : yqr_zxing.so")
+    print("Port   :", PORT)
+    print("URL    : http://127.0.0.1:5990")
+    print("======================================")
+    print()
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False
+    )
